@@ -1,0 +1,773 @@
+import cors from "cors";
+import "dotenv/config";
+import express, { NextFunction, Request, Response } from "express";
+import cron from "node-cron";
+import { getTallyCompanyDiagnostics } from "./company-registry";
+import { getDailySyncStatus, runDailySync } from "./daily-sync.service";
+import {
+  getHistoricalSyncStatus,
+  startHistoricalSyncInBackground,
+} from "./historical-sync.service";
+import {
+  getHistoricalTransactionsSyncStatus,
+  startHistoricalTransactionsSyncInBackground,
+} from "./historical-transactions.service";
+import {
+  acquireSingleInstanceLock,
+  releaseSingleInstanceLock,
+} from "./instance-lock";
+import { runFullSync, runStockItemsOnlySync } from "./sync.service";
+
+const app = express();
+
+app.use(cors());
+app.use(express.json());
+
+const PORT = Number(process.env.PORT || process.env.TALLY_AGENT_PORT || 5055);
+
+function readBoolEnv(name: string, fallback: boolean) {
+  const raw = process.env[name];
+
+  if (raw === undefined) return fallback;
+
+  return ["1", "true", "yes", "y"].includes(raw.trim().toLowerCase());
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const SYNC_INTERVAL_MINUTES = Math.max(
+  1,
+  Number(process.env.SYNC_INTERVAL_MINUTES || 30),
+);
+const SYNC_CRON =
+  process.env.SYNC_CRON || `*/${SYNC_INTERVAL_MINUTES} * * * *`;
+const AUTO_SYNC_DISABLED = readBoolEnv("DISABLE_AUTO_SYNC", false);
+const DAILY_SYNC_ENABLED = readBoolEnv("DAILY_SYNC_ENABLED", true);
+const DAILY_SYNC_RUN_ON_START = readBoolEnv(
+  "DAILY_SYNC_RUN_ON_START",
+  false,
+);
+const AUTO_SYNC_ENABLED = !AUTO_SYNC_DISABLED && DAILY_SYNC_ENABLED;
+
+acquireSingleInstanceLock("api-and-scheduler");
+
+let isManualSyncRunning = false;
+let lastManualSyncAt: string | null = null;
+let lastManualSyncStartedAt: string | null = null;
+let lastManualSyncCompletedAt: string | null = null;
+let lastManualSyncStatus: "idle" | "running" | "success" | "failed" = "idle";
+let lastManualSyncError: string | null = null;
+let lastManualSyncResult: any = null;
+
+function requireControlToken(req: Request, res: Response, next: NextFunction) {
+  const expectedToken = process.env.TALLY_AGENT_TOKEN || "";
+  const authHeader = req.headers.authorization || "";
+
+  const token = authHeader.startsWith("Bearer ")
+    ? authHeader.slice("Bearer ".length)
+    : "";
+
+  if (!expectedToken) {
+    return res.status(500).json({
+      statusCode: 500,
+      message: "TALLY_AGENT_TOKEN is missing in tally sync agent",
+      data: null,
+    });
+  }
+
+  if (!token || token !== expectedToken) {
+    return res.status(401).json({
+      statusCode: 401,
+      message: "Invalid tally agent control token",
+      data: null,
+    });
+  }
+
+  return next();
+}
+
+function getAgentStatus() {
+  return {
+    service: "tally-sync-agent",
+    status: lastManualSyncStatus,
+    is_running: isManualSyncRunning,
+    last_manual_sync_at: lastManualSyncAt,
+    last_manual_sync_started_at: lastManualSyncStartedAt,
+    last_manual_sync_completed_at: lastManualSyncCompletedAt,
+    last_error: lastManualSyncError,
+    last_result: lastManualSyncResult,
+    automatic_daily_sync: {
+      enabled: AUTO_SYNC_ENABLED,
+      disable_auto_sync: AUTO_SYNC_DISABLED,
+      daily_sync_enabled: DAILY_SYNC_ENABLED,
+      run_on_start: DAILY_SYNC_RUN_ON_START,
+      cron: SYNC_CRON,
+      interval_minutes: SYNC_INTERVAL_MINUTES,
+      company_selection: "all_loaded_companies",
+      runtime: getDailySyncStatus(),
+    },
+    time: new Date().toISOString(),
+  };
+}
+
+function isHistoricalSyncActive() {
+  const status = getHistoricalSyncStatus();
+
+  return Boolean(status?.isRunning || status?.progress?.isRunning);
+}
+
+function isHistoricalTransactionsSyncActive() {
+  const status = getHistoricalTransactionsSyncStatus();
+
+  return Boolean(status?.isRunning);
+}
+
+function getCompactSyncResult(result: any) {
+  if (!result) return null;
+
+  return {
+    skipped: result.skipped,
+    status: result.status,
+    syncMode: result.syncMode,
+    companies: {
+      count: result.companies?.count || 0,
+      successCount: result.companies?.successCount || 0,
+      failedCount: result.companies?.failedCount || 0,
+    },
+    totals: result.totals || {},
+    companyResults: Array.isArray(result.companyResults)
+      ? result.companyResults.map((item: any) => ({
+          company: {
+            name: item.company?.name || null,
+            guid: item.company?.guid || null,
+          },
+          ledgers: {
+            count: item.ledgers?.count || 0,
+            uploadedRecords: item.ledgers?.result?.uploadedRecords || 0,
+            failedRecords: item.ledgers?.result?.failedRecords || 0,
+            successBatches: item.ledgers?.result?.successBatches || 0,
+            failedBatches: item.ledgers?.result?.failedBatches || 0,
+          },
+          stockItems: {
+            count: item.stockItems?.count || 0,
+            uploadedRecords: item.stockItems?.result?.uploadedRecords || 0,
+            failedRecords: item.stockItems?.result?.failedRecords || 0,
+            successBatches: item.stockItems?.result?.successBatches || 0,
+            failedBatches: item.stockItems?.result?.failedBatches || 0,
+          },
+          costCenters: {
+            count: item.costCenters?.count || 0,
+            uploadedRecords: item.costCenters?.result?.uploadedRecords || 0,
+            failedRecords: item.costCenters?.result?.failedRecords || 0,
+            successBatches: item.costCenters?.result?.successBatches || 0,
+            failedBatches: item.costCenters?.result?.failedBatches || 0,
+          },
+        }))
+      : [],
+    failedCompanies: result.failedCompanies || [],
+  };
+}
+
+function startHistoricalTransactionRoute(
+  req: Request,
+  res: Response,
+  modules?: Array<
+    | "sales-vouchers"
+    | "purchase-vouchers"
+    | "outstandings"
+    | "delivery-challans"
+  >,
+) {
+  if (isManualSyncRunning) {
+    return res.status(409).json({
+      statusCode: 409,
+      message:
+        "Manual sync is already running. Historical transaction sync skipped.",
+      data: {
+        agent: getAgentStatus(),
+        historicalTransactions: getHistoricalTransactionsSyncStatus(),
+      },
+    });
+  }
+
+  if (isHistoricalSyncActive()) {
+    return res.status(409).json({
+      statusCode: 409,
+      message:
+        "Historical master sync is already running. Historical transaction sync skipped.",
+      data: {
+        agent: getAgentStatus(),
+        historical: getHistoricalSyncStatus(),
+        historicalTransactions: getHistoricalTransactionsSyncStatus(),
+      },
+    });
+  }
+
+  if (isHistoricalTransactionsSyncActive()) {
+    return res.status(409).json({
+      statusCode: 409,
+      message: "Historical transaction sync is already running.",
+      data: {
+        agent: getAgentStatus(),
+        historicalTransactions: getHistoricalTransactionsSyncStatus(),
+      },
+    });
+  }
+
+  const result = startHistoricalTransactionsSyncInBackground({
+    fromDate: req.body?.fromDate || undefined,
+    toDate: req.body?.toDate || undefined,
+    companyName: req.body?.companyName || undefined,
+    modules:
+      modules ||
+      (Array.isArray(req.body?.modules) ? req.body.modules : undefined),
+    forceRestart: Boolean(req.body?.forceRestart),
+  });
+
+  return res.status(result.started ? 202 : 409).json({
+    statusCode: result.started ? 202 : 409,
+    message: result.message,
+    data: result.data,
+  });
+}
+
+/**
+ * CRM backend will call this API for connection check.
+ */
+app.get("/health", requireControlToken, (_req: Request, res: Response) => {
+  return res.json({
+    statusCode: 200,
+    message: "Tally sync agent is reachable",
+    data: getAgentStatus(),
+  });
+});
+
+app.get(
+  "/diagnostics/companies",
+  requireControlToken,
+  async (_req: Request, res: Response, next: NextFunction) => {
+    try {
+      const diagnostics = await getTallyCompanyDiagnostics();
+
+      return res.status(200).json({
+        statusCode: 200,
+        message: "Tally company diagnostics fetched",
+        data: diagnostics,
+      });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+/**
+ * Runs the exact automatic daily-sync flow immediately for verification.
+ * This processes every company currently loaded in Tally.
+ */
+app.post(
+  "/sync/daily",
+  requireControlToken,
+  async (_req: Request, res: Response) => {
+    const result = await executeAutomaticDailySync("manual");
+    const statusCode = result?.skipped
+      ? 409
+      : result?.status === "failed"
+        ? 500
+        : 200;
+
+    return res.status(statusCode).json({
+      statusCode,
+      message: result?.skipped
+        ? "Daily sync skipped because another sync is running"
+        : result?.status === "failed"
+          ? "Daily sync failed"
+          : "Daily sync completed",
+      data: result,
+    });
+  },
+);
+
+/**
+ * CRM backend will call this API from frontend Run Sync button.
+ * This returns immediately and sync runs in background.
+ */
+app.post(
+  "/sync/run",
+  requireControlToken,
+  async (req: Request, res: Response) => {
+    if (isManualSyncRunning) {
+      return res.status(409).json({
+        statusCode: 409,
+        message: "Tally sync is already running",
+        data: getAgentStatus(),
+      });
+    }
+
+    if (isHistoricalSyncActive()) {
+      return res.status(409).json({
+        statusCode: 409,
+        message: "Historical sync is already running. Manual sync skipped.",
+        data: {
+          agent: getAgentStatus(),
+          historical: getHistoricalSyncStatus(),
+        },
+      });
+    }
+
+    if (isHistoricalTransactionsSyncActive()) {
+      return res.status(409).json({
+        statusCode: 409,
+        message:
+          "Historical transaction sync is already running. Manual sync skipped.",
+        data: {
+          agent: getAgentStatus(),
+          historicalTransactions: getHistoricalTransactionsSyncStatus(),
+        },
+      });
+    }
+
+    const companySelection = {
+      companyName: req.body?.companyName || undefined,
+      companyGuid: req.body?.companyGuid || undefined,
+    };
+
+    isManualSyncRunning = true;
+    lastManualSyncStatus = "running";
+    lastManualSyncStartedAt = new Date().toISOString();
+    lastManualSyncCompletedAt = null;
+    lastManualSyncError = null;
+    lastManualSyncResult = null;
+
+    res.json({
+      statusCode: 200,
+      message: "Tally sync started",
+      data: getAgentStatus(),
+    });
+
+    try {
+      console.log(`[MANUAL SYNC] Started at ${lastManualSyncStartedAt}`);
+
+      // const result = await runFullSync(companySelection);
+
+      const result =
+        req.body?.module === "stock-items"
+          ? await runStockItemsOnlySync(companySelection)
+          : await runFullSync(companySelection);
+
+      lastManualSyncAt = new Date().toISOString();
+      lastManualSyncCompletedAt = lastManualSyncAt;
+      lastManualSyncStatus = "success";
+
+      const compactResult = getCompactSyncResult(result);
+
+      lastManualSyncResult = compactResult;
+
+      console.log("[MANUAL SYNC] Completed", compactResult);
+    } catch (error: any) {
+      lastManualSyncCompletedAt = new Date().toISOString();
+      lastManualSyncStatus = "failed";
+      lastManualSyncError = error?.message || "Manual sync failed";
+
+      console.error("[MANUAL SYNC] Failed", error?.message || error);
+    } finally {
+      isManualSyncRunning = false;
+    }
+  },
+);
+
+/**
+ * Optional old route.
+ * Keep it for local testing but secure it also.
+ */
+app.post(
+  "/sync-now",
+  requireControlToken,
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      if (isManualSyncRunning) {
+        return res.status(409).json({
+          statusCode: 409,
+          message: "Tally sync is already running",
+          data: getAgentStatus(),
+        });
+      }
+
+      if (isHistoricalSyncActive()) {
+        return res.status(409).json({
+          statusCode: 409,
+          message: "Historical sync is already running. Sync now skipped.",
+          data: {
+            agent: getAgentStatus(),
+            historical: getHistoricalSyncStatus(),
+          },
+        });
+      }
+
+      if (isHistoricalTransactionsSyncActive()) {
+        return res.status(409).json({
+          statusCode: 409,
+          message:
+            "Historical transaction sync is already running. Sync now skipped.",
+          data: {
+            agent: getAgentStatus(),
+            historicalTransactions: getHistoricalTransactionsSyncStatus(),
+          },
+        });
+      }
+
+      isManualSyncRunning = true;
+      lastManualSyncStatus = "running";
+      lastManualSyncStartedAt = new Date().toISOString();
+      lastManualSyncCompletedAt = null;
+      lastManualSyncError = null;
+      lastManualSyncResult = null;
+
+      const result = await runFullSync({
+        companyName: req.body?.companyName || undefined,
+        companyGuid: req.body?.companyGuid || undefined,
+      });
+
+      lastManualSyncAt = new Date().toISOString();
+      lastManualSyncCompletedAt = lastManualSyncAt;
+      lastManualSyncStatus = "success";
+      const compactResult = getCompactSyncResult(result);
+
+      lastManualSyncResult = compactResult;
+
+      return res.json({
+        statusCode: 200,
+        message: "Tally sync completed",
+        data: {
+          ...getAgentStatus(),
+          result: compactResult,
+        },
+      });
+    } catch (error: any) {
+      lastManualSyncCompletedAt = new Date().toISOString();
+      lastManualSyncStatus = "failed";
+      lastManualSyncError = error?.message || "Manual sync failed";
+
+      next(error);
+    } finally {
+      isManualSyncRunning = false;
+    }
+  },
+);
+
+app.get("/sync/historical/status", requireControlToken, (_req, res) => {
+  return res.status(200).json({
+    statusCode: 200,
+    message: "Historical sync status fetched",
+    data: getHistoricalSyncStatus(),
+  });
+});
+
+app.get("/sync/historical/progress", requireControlToken, (_req, res) => {
+  const status = getHistoricalSyncStatus();
+
+  return res.status(200).json({
+    statusCode: 200,
+    message: "Historical sync live progress fetched",
+    data: status.live,
+  });
+});
+
+app.post("/sync/historical", requireControlToken, (req, res) => {
+  if (isManualSyncRunning) {
+    return res.status(409).json({
+      statusCode: 409,
+      message: "Manual sync is already running. Historical sync skipped.",
+      data: {
+        agent: getAgentStatus(),
+        historical: getHistoricalSyncStatus(),
+      },
+    });
+  }
+
+  if (isHistoricalTransactionsSyncActive()) {
+    return res.status(409).json({
+      statusCode: 409,
+      message:
+        "Historical transaction sync is already running. Historical master sync skipped.",
+      data: {
+        agent: getAgentStatus(),
+        historicalTransactions: getHistoricalTransactionsSyncStatus(),
+      },
+    });
+  }
+
+  const result = startHistoricalSyncInBackground({
+    startYear: req.body?.startYear ? Number(req.body.startYear) : undefined,
+    fromDate: req.body?.fromDate || undefined,
+    toDate: req.body?.toDate || undefined,
+    companyName: req.body?.companyName || undefined,
+    forceRestart: Boolean(req.body?.forceRestart),
+  });
+
+  return res.status(result.started ? 202 : 409).json({
+    statusCode: result.started ? 202 : 409,
+    message: result.message,
+    data: result.data,
+  });
+});
+
+app.get(
+  "/sync/historical-transactions/status",
+  requireControlToken,
+  (_req, res) => {
+    return res.status(200).json({
+      statusCode: 200,
+      message: "Historical transaction sync status fetched",
+      data: getHistoricalTransactionsSyncStatus(),
+    });
+  },
+);
+
+app.get(
+  "/sync/historical/sales-vouchers/status",
+  requireControlToken,
+  (_req, res) => {
+    return res.status(200).json({
+      statusCode: 200,
+      message: "Historical sales vouchers sync status fetched",
+      data: getHistoricalTransactionsSyncStatus(),
+    });
+  },
+);
+
+app.get(
+  "/sync/historical/purchase-vouchers/status",
+  requireControlToken,
+  (_req, res) => {
+    return res.status(200).json({
+      statusCode: 200,
+      message: "Historical purchase vouchers sync status fetched",
+      data: getHistoricalTransactionsSyncStatus(),
+    });
+  },
+);
+
+app.get(
+  "/sync/historical/outstandings/status",
+  requireControlToken,
+  (_req, res) => {
+    return res.status(200).json({
+      statusCode: 200,
+      message: "Historical outstandings sync status fetched",
+      data: getHistoricalTransactionsSyncStatus(),
+    });
+  },
+);
+
+app.get(
+  "/sync/historical/delivery-challans/status",
+  requireControlToken,
+  (_req, res) => {
+    return res.status(200).json({
+      statusCode: 200,
+      message: "Historical delivery challans sync status fetched",
+      data: getHistoricalTransactionsSyncStatus(),
+    });
+  },
+);
+
+app.post("/sync/historical/sales-vouchers", requireControlToken, (req, res) =>
+  startHistoricalTransactionRoute(req, res, ["sales-vouchers"]),
+);
+
+app.post(
+  "/sync/historical/purchase-vouchers",
+  requireControlToken,
+  (req, res) =>
+    startHistoricalTransactionRoute(req, res, ["purchase-vouchers"]),
+);
+
+app.post("/sync/historical/outstandings", requireControlToken, (req, res) =>
+  startHistoricalTransactionRoute(req, res, ["outstandings"]),
+);
+
+app.post(
+  "/sync/historical/delivery-challans",
+  requireControlToken,
+  (req, res) =>
+    startHistoricalTransactionRoute(req, res, ["delivery-challans"]),
+);
+
+// Short aliases for RDP/manual use.
+app.post("/sync/historical/so", requireControlToken, (req, res) =>
+  startHistoricalTransactionRoute(req, res, ["sales-vouchers"]),
+);
+
+app.post("/sync/historical/po", requireControlToken, (req, res) =>
+  startHistoricalTransactionRoute(req, res, ["purchase-vouchers"]),
+);
+
+app.post("/sync/historical/os", requireControlToken, (req, res) =>
+  startHistoricalTransactionRoute(req, res, ["outstandings"]),
+);
+
+app.post("/sync/historical/dc", requireControlToken, (req, res) =>
+  startHistoricalTransactionRoute(req, res, ["delivery-challans"]),
+);
+
+app.post("/sync/historical-transactions", requireControlToken, (req, res) => {
+  return startHistoricalTransactionRoute(req, res);
+});
+
+/**
+ * Alias for readability from CRM/backend/Postman.
+ */
+app.post("/sync/transactions/historical", requireControlToken, (req, res) => {
+  return startHistoricalTransactionRoute(req, res);
+});
+
+async function executeAutomaticDailySync(
+  source: "startup" | "cron" | "manual",
+) {
+  try {
+    if (isManualSyncRunning) {
+      console.log(
+        `[DAILY SYNC:${source}] Skipped because manual sync is running`,
+      );
+      return { skipped: true, status: "skipped" };
+    }
+
+    if (isHistoricalSyncActive()) {
+      console.log(
+        `[DAILY SYNC:${source}] Skipped because historical master sync is running`,
+      );
+      return { skipped: true, status: "skipped" };
+    }
+
+    if (isHistoricalTransactionsSyncActive()) {
+      console.log(
+        `[DAILY SYNC:${source}] Skipped because historical transaction sync is running`,
+      );
+      return { skipped: true, status: "skipped" };
+    }
+
+    console.log(`[DAILY SYNC:${source}] Started`, {
+      at: new Date().toISOString(),
+      companySelection: "all_loaded_companies",
+    });
+
+    const result = await runDailySync();
+
+    console.log(`[DAILY SYNC:${source}] Completed`, {
+      status: result?.status || null,
+      skipped: Boolean(result?.skipped),
+      companies: result?.companies?.count || 0,
+      failedCompanies: result?.failedCompanies?.length || 0,
+      range: result?.range || null,
+    });
+
+    return result;
+  } catch (error: any) {
+    console.error(
+      `[DAILY SYNC:${source}] Failed`,
+      error?.message || error,
+    );
+
+    return {
+      skipped: false,
+      status: "failed",
+      error: error?.message || "Daily sync failed",
+    };
+  }
+}
+
+async function runStartupDailySyncWhenReady() {
+  const pollSeconds = Math.max(
+    10,
+    Number(process.env.DAILY_SYNC_STARTUP_POLL_SECONDS || 30),
+  );
+  const maxWaitMinutes = Math.max(
+    0,
+    Number(process.env.DAILY_SYNC_STARTUP_MAX_WAIT_MINUTES || 0),
+  );
+  const startedAtMs = Date.now();
+
+  console.log("[DAILY SYNC:startup] Waiting for Tally loaded companies", {
+    pollSeconds,
+    maxWaitMinutes: maxWaitMinutes || "unlimited",
+  });
+
+  while (true) {
+    if (
+      maxWaitMinutes > 0 &&
+      Date.now() - startedAtMs > maxWaitMinutes * 60 * 1000
+    ) {
+      console.warn(
+        "[DAILY SYNC:startup] Startup wait stopped because max wait was reached",
+      );
+      return;
+    }
+
+    const result = await executeAutomaticDailySync("startup");
+
+    if (
+      !result?.skipped &&
+      (result?.status === "success" || result?.status === "partial_success")
+    ) {
+      return;
+    }
+
+    await sleep(pollSeconds * 1000);
+  }
+}
+
+if (AUTO_SYNC_ENABLED) {
+  if (!cron.validate(SYNC_CRON)) {
+    throw new Error(`Invalid SYNC_CRON expression: ${SYNC_CRON}`);
+  }
+
+  cron.schedule(SYNC_CRON, async () => {
+    await executeAutomaticDailySync("cron");
+  });
+
+  console.log("[DAILY SYNC] Cron scheduled", {
+    syncCron: SYNC_CRON,
+    syncIntervalMinutes: SYNC_INTERVAL_MINUTES,
+    companySelection: "all_loaded_companies",
+  });
+} else {
+  console.log("[DAILY SYNC] Automatic sync disabled", {
+    DISABLE_AUTO_SYNC: AUTO_SYNC_DISABLED,
+    DAILY_SYNC_ENABLED,
+  });
+}
+
+app.use((error: any, _req: Request, res: Response, _next: NextFunction) => {
+  console.error("[AGENT ERROR]", error?.message || error);
+
+  return res.status(500).json({
+    statusCode: 500,
+    message: error?.message || "Tally sync agent error",
+    data: null,
+  });
+});
+
+let isShuttingDown = false;
+
+function shutdown(signal: string) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+
+  console.log(`[AGENT] Shutting down via ${signal}`);
+  releaseSingleInstanceLock();
+  process.exit(0);
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("exit", () => releaseSingleInstanceLock());
+
+app.listen(PORT, () => {
+  console.log(`Tally Sync Agent running on port ${PORT}`);
+
+  if (AUTO_SYNC_ENABLED && DAILY_SYNC_RUN_ON_START) {
+    void runStartupDailySyncWhenReady();
+  }
+});
