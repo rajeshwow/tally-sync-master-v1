@@ -259,6 +259,7 @@ function shouldStrictlyValidateModule(moduleName: string) {
     "purchase-orders",
     "outstandings",
     "stock-items",
+    "delivery-challans",
   ].includes(moduleName);
 }
 

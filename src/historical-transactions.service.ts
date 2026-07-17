@@ -297,8 +297,16 @@ function buildCleanConsoleLog(
     return `✅ PO pushed    | ${range} | pushed=${formatLogNumber(details?.pushed)} | uploaded=${formatLogNumber(details?.uploaded)} | batches=${formatLogNumber(details?.batches)}`;
   }
 
+  if (message === "Delivery note range collected") {
+    return `✅ DC collected | ${range} | raw=${formatLogNumber(details?.raw)} | inRange=${formatLogNumber(details?.inRange)} | push=${formatLogNumber(details?.pushRecords)} | dup=${formatLogNumber(details?.duplicates)}`;
+  }
+
+  if (message === "Delivery note range pushed") {
+    return `✅ DC pushed    | ${range} | pushed=${formatLogNumber(details?.pushed)} | uploaded=${formatLogNumber(details?.uploaded)} | batches=${formatLogNumber(details?.batches)}`;
+  }
+
   if (message === "Transaction range completed") {
-    return `✅ Range done   | ${range} | SO=${details?.salesParsed ?? "-"} | PO=${details?.purchaseParsed ?? "-"}`;
+    return `✅ Range done   | ${range} | SO=${details?.salesParsed ?? "-"} | PO=${details?.purchaseParsed ?? "-"} | DC=${details?.deliveryChallansParsed ?? "-"}`;
   }
 
   if (message === "Official outstanding report sync started") {
@@ -322,7 +330,7 @@ function buildCleanConsoleLog(
   }
 
   if (message === "Company transaction sync completed") {
-    return `🏁 Company done | SO uploaded=${formatLogNumber(details?.salesUploaded)} | PO uploaded=${formatLogNumber(details?.purchaseUploaded)} | OS uploaded=${formatLogNumber(details?.outstandingUploaded)}`;
+    return `🏁 Company done | SO uploaded=${formatLogNumber(details?.salesUploaded)} | PO uploaded=${formatLogNumber(details?.purchaseUploaded)} | DC uploaded=${formatLogNumber(details?.deliveryChallansUploaded)} | OS uploaded=${formatLogNumber(details?.outstandingUploaded)}`;
   }
 
   if (message === "Historical transaction sync completed") {
