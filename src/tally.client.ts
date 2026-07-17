@@ -505,25 +505,44 @@ export async function fetchSalesOrdersXml(
   return postToTally(xml);
 }
 
-export async function fetchDeliveryChallansXml(
-  companyName?: string,
-  dateRange?: TallyDateRange,
-) {
-  const xml = `
+function getDeliveryChallanVoucherTypes() {
+  const configured = String(
+    process.env.TALLY_DELIVERY_CHALLAN_VOUCHER_TYPES ||
+      "Challan Material,Delivery Note",
+  )
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+  return Array.from(new Set(configured));
+}
+
+function buildDeliveryChallanVoucherTypeXml(input: {
+  reportId: string;
+  collectionName: string;
+  voucherTypeName: string;
+  companyName?: string;
+  dateRange?: TallyDateRange;
+}) {
+  return `
 <ENVELOPE>
   <HEADER>
     <VERSION>1</VERSION>
     <TALLYREQUEST>Export</TALLYREQUEST>
     <TYPE>Collection</TYPE>
-    <ID>CRM Delivery Notes Register</ID>
+    <ID>${escapeXml(input.reportId)}</ID>
   </HEADER>
   <BODY>
     <DESC>
-      ${buildStaticVariables(companyName, buildDateRangeVariables(dateRange))}
+      ${buildStaticVariables(
+        input.companyName,
+        buildDateRangeVariables(input.dateRange),
+      )}
       <TDL>
         <TDLMESSAGE>
-          <COLLECTION NAME="CRM Delivery Notes Register" ISMODIFY="No">
-            <TYPE>Voucher</TYPE>
+          <COLLECTION NAME="${escapeXml(input.collectionName)}" ISMODIFY="No">
+            <TYPE>Vouchers : VoucherType</TYPE>
+            <CHILDOF>${escapeXml(input.voucherTypeName)}</CHILDOF>
             <BELONGSTO>Yes</BELONGSTO>
             <FETCH>
   Date,
@@ -560,97 +579,68 @@ export async function fetchDeliveryChallansXml(
   CategoryAllocations,
   CostCentreAllocations
 </FETCH>
-            <FILTER>OnlyDeliveryNoteVouchers</FILTER>
             <FILTER>DateInSelectedRange</FILTER>
           </COLLECTION>
-
-         <SYSTEM TYPE="Formulae" NAME="OnlyDeliveryNoteVouchers">
-  $$IsDeliveryNote:$VoucherTypeName
-  OR $VoucherTypeName = "Challan Material"
-</SYSTEM>
-          ${buildDateRangeFilterFormula(dateRange)}
+          ${buildDateRangeFilterFormula(input.dateRange)}
         </TDLMESSAGE>
       </TDL>
     </DESC>
   </BODY>
 </ENVELOPE>
 `;
+}
 
-  return postToTally(xml);
+async function fetchDeliveryChallansByVoucherType(input: {
+  reportPrefix: string;
+  collectionPrefix: string;
+  companyName?: string;
+  dateRange?: TallyDateRange;
+}) {
+  const voucherTypes = getDeliveryChallanVoucherTypes();
+  const responses: string[] = [];
+
+  for (let index = 0; index < voucherTypes.length; index += 1) {
+    const voucherTypeName = voucherTypes[index];
+    const suffix = index + 1;
+
+    const xml = buildDeliveryChallanVoucherTypeXml({
+      reportId: `${input.reportPrefix} ${suffix}`,
+      collectionName: `${input.collectionPrefix} ${suffix}`,
+      voucherTypeName,
+      companyName: input.companyName,
+      dateRange: input.dateRange,
+    });
+
+    responses.push(await postToTally(xml));
+  }
+
+  // Multiple Tally XML responses are combined.
+  // Mapper extracts individual <VOUCHER> blocks from the combined response.
+  return responses.join("\n");
+}
+
+export async function fetchDeliveryChallansXml(
+  companyName?: string,
+  dateRange?: TallyDateRange,
+) {
+  return fetchDeliveryChallansByVoucherType({
+    reportPrefix: "CRM Delivery Notes Register",
+    collectionPrefix: "CRM Delivery Notes Register",
+    companyName,
+    dateRange,
+  });
 }
 
 export async function fetchHistoricalDeliveryChallansXml(
   companyName?: string,
   dateRange?: TallyDateRange,
 ) {
-  const xml = `
-<ENVELOPE>
-  <HEADER>
-    <VERSION>1</VERSION>
-    <TALLYREQUEST>Export</TALLYREQUEST>
-    <TYPE>Collection</TYPE>
-    <ID>CRM Deep Delivery Notes Register</ID>
-  </HEADER>
-  <BODY>
-    <DESC>
-      ${buildStaticVariables(companyName, buildDateRangeVariables(dateRange))}
-      <TDL>
-        <TDLMESSAGE>
-          <COLLECTION NAME="CRM Deep Delivery Notes Register" ISMODIFY="No">
-            <TYPE>Voucher</TYPE>
-            <BELONGSTO>Yes</BELONGSTO>
-            <FETCH>
-  Date,
-  ReferenceDate,
-  Guid,
-  VoucherKey,
-  MasterId,
-  AlterId,
-  VoucherNumber,
-  VoucherTypeName,
-  PartyLedgerName,
-  PartyName,
-  Reference,
-  Narration,
-  Amount,
-  BasicBuyerName,
-  BasicOrderRef,
-  BasicDueDateOfPymt,
-  BasicShippedBy,
-  BasicFinalDestination,
-  PlaceOfSupply,
-  CmpGstState,
-  ConsigneeStateName,
-  ConsigneePinCode,
-  PartyPinCode,
-  CostCentreName,
-  CostCenterName,
-  CostCategoryName,
-  LedgerEntries,
-  AllLedgerEntries,
-  BillAllocations,
-  InventoryEntries,
-  AllInventoryEntries,
-  CategoryAllocations,
-  CostCentreAllocations
-</FETCH>
-            <FILTER>OnlyDeepDeliveryNoteVouchers</FILTER>
-            <FILTER>DateInSelectedRange</FILTER>
-          </COLLECTION>
-
-        <SYSTEM TYPE="Formulae" NAME="OnlyDeepDeliveryNoteVouchers">
-  $$IsDeliveryNote:$VoucherTypeName
-  OR $VoucherTypeName = "Challan Material"
-</SYSTEM>
-          ${buildDateRangeFilterFormula(dateRange)}
-        </TDLMESSAGE>
-      </TDL>
-    </DESC>
-  </BODY>
-</ENVELOPE>
-`;
-
-  return postToTally(xml);
+  return fetchDeliveryChallansByVoucherType({
+    reportPrefix: "CRM Deep Delivery Notes Register",
+    collectionPrefix: "CRM Deep Delivery Notes Register",
+    companyName,
+    dateRange,
+  });
 }
 
 export async function fetchPurchaseOrdersXml(
