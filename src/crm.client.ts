@@ -373,10 +373,6 @@ async function pushRecordsToCrm(
 
   const company = options.companyName ? ` [${options.companyName}]` : "";
 
-  // console.log(
-  //   `[SYNC]${company} ${moduleName.padEnd(18)} → ${safeRecords.length} records, ${batches.length} batches`,
-  // );
-
   if (!safeRecords.length) {
     if (options.isFullSnapshot) {
       const meta = {
