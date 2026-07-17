@@ -41,14 +41,10 @@ const SYNC_INTERVAL_MINUTES = Math.max(
   1,
   Number(process.env.SYNC_INTERVAL_MINUTES || 30),
 );
-const SYNC_CRON =
-  process.env.SYNC_CRON || `*/${SYNC_INTERVAL_MINUTES} * * * *`;
+const SYNC_CRON = process.env.SYNC_CRON || `*/${SYNC_INTERVAL_MINUTES} * * * *`;
 const AUTO_SYNC_DISABLED = readBoolEnv("DISABLE_AUTO_SYNC", false);
 const DAILY_SYNC_ENABLED = readBoolEnv("DAILY_SYNC_ENABLED", true);
-const DAILY_SYNC_RUN_ON_START = readBoolEnv(
-  "DAILY_SYNC_RUN_ON_START",
-  false,
-);
+const DAILY_SYNC_RUN_ON_START = readBoolEnv("DAILY_SYNC_RUN_ON_START", false);
 const AUTO_SYNC_ENABLED = !AUTO_SYNC_DISABLED && DAILY_SYNC_ENABLED;
 
 acquireSingleInstanceLock("api-and-scheduler");
@@ -216,14 +212,35 @@ function startHistoricalTransactionRoute(
     });
   }
 
+  const requestedCompanyName = req.body?.companyName || undefined;
+  const requestedCompanyGuid = req.body?.companyGuid || undefined;
+
   const result = startHistoricalTransactionsSyncInBackground({
     fromDate: req.body?.fromDate || undefined,
     toDate: req.body?.toDate || undefined,
-    companyName: req.body?.companyName || undefined,
+
+    companyName: requestedCompanyName,
+    companyGuid: requestedCompanyGuid,
+
+    // Company body me nahi di to currently loaded sab companies sync hongi.
+    // Purani .env company selection use nahi hogi.
+    syncAllLoadedCompanies:
+      req.body?.syncAllLoadedCompanies !== undefined
+        ? Boolean(req.body.syncAllLoadedCompanies)
+        : !requestedCompanyName && !requestedCompanyGuid,
+
+    // Explicit company old TALLY_COMPANIES allowlist me na ho tab bhi sync allow hoga.
+    skipConfiguredAllowlist: Boolean(req.body?.skipConfiguredAllowlist),
+
     modules:
       modules ||
       (Array.isArray(req.body?.modules) ? req.body.modules : undefined),
+
     forceRestart: Boolean(req.body?.forceRestart),
+    skipCheckpoints: Boolean(req.body?.skipCheckpoints),
+
+    syncMode:
+      req.body?.syncMode === "incremental" ? "incremental" : "historical",
   });
 
   return res.status(result.started ? 202 : 409).json({
@@ -665,10 +682,7 @@ async function executeAutomaticDailySync(
 
     return result;
   } catch (error: any) {
-    console.error(
-      `[DAILY SYNC:${source}] Failed`,
-      error?.message || error,
-    );
+    console.error(`[DAILY SYNC:${source}] Failed`, error?.message || error);
 
     return {
       skipped: false,
