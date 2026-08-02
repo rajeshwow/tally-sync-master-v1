@@ -265,6 +265,28 @@ export async function fetchLedgersXml(companyName?: string) {
   return postToTally(xml);
 }
 
+function buildTodayDateVariables() {
+  const today = new Date();
+  const todayDisplay = escapeXml(
+    formatTallyDisplayDate(
+      `${today.getFullYear()}${String(today.getMonth() + 1).padStart(2, "0")}${String(today.getDate()).padStart(2, "0")}`,
+    ),
+  );
+
+  /**
+   * Pin SVCurrentDate and SVToDate to today so Tally computes ClosingBalance
+   * as of the actual current date — not whatever period was last open in the UI.
+   * Without this, Tally uses the screen context (e.g. "1-Apr-2023 to 30-Jul-2026")
+   * which can return stale/wrong closing quantities.
+   */
+  return `
+        <SVCurrentDate TYPE="Date">${todayDisplay}</SVCurrentDate>
+        <SVToDate TYPE="Date">${todayDisplay}</SVToDate>
+        <SVCURRENTDATE TYPE="Date">${todayDisplay}</SVCURRENTDATE>
+        <SVTODATE TYPE="Date">${todayDisplay}</SVTODATE>
+`;
+}
+
 export async function fetchStockItemsXml(companyName?: string) {
   const xml = `
 <ENVELOPE>
@@ -276,7 +298,7 @@ export async function fetchStockItemsXml(companyName?: string) {
   </HEADER>
   <BODY>
     <DESC>
-      ${buildStaticVariables(companyName)}
+      ${buildStaticVariables(companyName, buildTodayDateVariables())}
       <TDL>
         <TDLMESSAGE>
           <COLLECTION NAME="CRM Stock Items" ISMODIFY="No">
