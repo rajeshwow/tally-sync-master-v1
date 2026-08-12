@@ -1533,7 +1533,23 @@ function parseOfficialBillFixedOutstandingRows(
         stripXml(readTag(segment, "PENDINGAMOUNT")) ||
         stripXml(readTag(segment, "AMOUNT"));
 
+      const signedPendingAmount = toSignedNumberLike(pendingAmountRaw);
       const pendingAmount = toAbsNumberLike(pendingAmountRaw);
+      const drCr = getDrCr(pendingAmountRaw);
+
+      const isCreditAdjustment =
+        (billType === "receivable" && (signedPendingAmount < 0 || drCr === "Cr")) ||
+        (billType === "payable" && (signedPendingAmount < 0 || drCr === "Dr"));
+
+      const effectiveBillType = isCreditAdjustment
+        ? billType === "receivable"
+          ? "credit_note"
+          : "debit_note"
+        : billType;
+
+      const finalPendingAmount = isCreditAdjustment
+        ? -Math.abs(pendingAmount)
+        : Math.abs(pendingAmount);
 
       const dueDate =
         readTallyDate(segment, "BILLDUE") ||
@@ -1558,11 +1574,11 @@ function parseOfficialBillFixedOutstandingRows(
         dueDate,
 
         billRef,
-        billType,
+        billType: effectiveBillType,
         openingAmount: pendingAmount,
         billAmount: pendingAmount,
-        pendingAmount,
-        outstandingAmount: pendingAmount,
+        pendingAmount: finalPendingAmount,
+        outstandingAmount: finalPendingAmount,
 
         costCenterName: null,
         cost_center_name: null,
@@ -1577,7 +1593,7 @@ function parseOfficialBillFixedOutstandingRows(
         cost_center_allocations: [],
 
         overdueDays: toAbsNumberLike(overdueDaysRaw),
-        drCr: getDrCr(pendingAmountRaw),
+        drCr,
 
         partyType: null,
         tallyGuid: null,
@@ -1597,7 +1613,7 @@ function parseOfficialBillFixedOutstandingRows(
         due_date: dueDate,
 
         bill_ref: billRef,
-        bill_type: billType,
+        bill_type: effectiveBillType,
 
         rawTallyData: segment,
         raw_tally_data: segment,
@@ -1607,7 +1623,7 @@ function parseOfficialBillFixedOutstandingRows(
       (row) =>
         row.ledgerName &&
         row.billRef &&
-        row.pendingAmount > 0 &&
+        Math.abs(row.pendingAmount) > 0 &&
         !isNonPartyOutstandingLedger(row.ledgerName),
     );
 }
