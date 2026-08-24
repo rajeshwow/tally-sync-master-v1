@@ -90,6 +90,27 @@ export async function getAvailableTallyCompanies(): Promise<
   return companies;
 }
 
+export function getExcludedCompanySelectors(): ConfiguredCompanySelector[] {
+  const rawEnv =
+    process.env.EXCLUDED_TALLY_COMPANIES ||
+    process.env.TALLY_EXCLUDED_COMPANIES;
+  const list = rawEnv
+    ? rawEnv
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean)
+    : ["ATVI COMPUTECH PVT LTD CHALLAN", "Bispl", "Atvi"];
+
+  return list.map(parseConfiguredToken);
+}
+
+export function isCompanyExcluded(company: TallyCompanyForSync): boolean {
+  const excludedSelectors = getExcludedCompanySelectors();
+  return excludedSelectors.some((selector) =>
+    selectorMatchesCompany(selector, company),
+  );
+}
+
 function selectorMatchesCompany(
   selector: ConfiguredCompanySelector,
   company: TallyCompanyForSync,
@@ -114,16 +135,24 @@ export async function resolveConfiguredTallyCompanies(
 ): Promise<TallyCompanyForSync[]> {
   if (selection.syncAllLoadedCompanies) {
     const loadedCompanies = await getAvailableTallyCompanies();
+    const activeCompanies = loadedCompanies.filter(
+      (company) => !isCompanyExcluded(company),
+    );
 
-    console.log("[TALLY] All loaded companies selected for sync", {
-      count: loadedCompanies.length,
-      companies: loadedCompanies.map((company) => ({
-        name: company.name,
-        guid: company.guid || null,
-      })),
-    });
+    console.log(
+      "[TALLY] Loaded companies selected for sync (after exclusion filter)",
+      {
+        totalCount: loadedCompanies.length,
+        activeCount: activeCompanies.length,
+        excludedCount: loadedCompanies.length - activeCompanies.length,
+        activeCompanies: activeCompanies.map((company) => ({
+          name: company.name,
+          guid: company.guid || null,
+        })),
+      },
+    );
 
-    return loadedCompanies;
+    return activeCompanies;
   }
 
   const configured = getConfiguredCompanySelectors();
@@ -135,6 +164,12 @@ export async function resolveConfiguredTallyCompanies(
       companyGuid: explicitGuid || null,
       companyName: explicitName || null,
     });
+
+    if (isCompanyExcluded(selected)) {
+      throw new Error(
+        `Requested Tally company "${selected.name}" is excluded from sync. Sync stopped for safety.`,
+      );
+    }
 
     if (
       !selection.skipConfiguredAllowlist &&
@@ -155,7 +190,9 @@ export async function resolveConfiguredTallyCompanies(
     );
   }
 
-  const available = await getAvailableTallyCompanies();
+  const available = (await getAvailableTallyCompanies()).filter(
+    (company) => !isCompanyExcluded(company),
+  );
   const resolved: TallyCompanyForSync[] = [];
   const missing: string[] = [];
 
@@ -187,7 +224,7 @@ export async function resolveConfiguredTallyCompanies(
       .join(" | ");
 
     throw new Error(
-      `Configured Tally companies not found exactly: ${missing.join(", ")}. Available: ${availableText}`,
+      `Configured Tally companies not found or are excluded: ${missing.join(", ")}. Available: ${availableText}`,
     );
   }
 
@@ -202,17 +239,21 @@ export async function resolveConfiguredTallyCompanies(
 
 export async function getTallyCompanyDiagnostics() {
   const configured = getConfiguredCompanySelectors();
+  const excluded = getExcludedCompanySelectors();
   const available = await getAvailableTallyCompanies();
+  const activeAvailable = available.filter((c) => !isCompanyExcluded(c));
 
   const resolved = configured.length
     ? await resolveConfiguredTallyCompanies()
-    : [];
+    : activeAvailable;
 
   return {
     configured,
+    excluded,
     available,
+    active_available: activeAvailable,
     resolved,
-    safe_to_sync:
-      configured.length > 0 && resolved.length === configured.length,
+    safe_to_sync: resolved.length > 0,
   };
 }
+
