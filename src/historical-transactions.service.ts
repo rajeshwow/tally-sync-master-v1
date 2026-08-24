@@ -1136,6 +1136,17 @@ function parseOfficialBillWiseOutstandingReport(input: {
       stripXml(readTag(segment, "CLOSINGBALANCE")) ||
       stripXml(readTag(segment, "PENDINGAMOUNT"));
 
+    const billOpeningRaw =
+      stripXml(readTag(fixedBlock, "BILLOP")) ||
+      stripXml(readTag(segment, "BILLOP")) ||
+      stripXml(readTag(fixedBlock, "BILLOPENING")) ||
+      stripXml(readTag(segment, "BILLOPENING")) ||
+      stripXml(readTag(fixedBlock, "OPENINGBALANCE")) ||
+      stripXml(readTag(segment, "OPENINGBALANCE")) ||
+      stripXml(readTag(fixedBlock, "BILLAMOUNT")) ||
+      stripXml(readTag(segment, "BILLAMOUNT")) ||
+      billCloseRaw;
+
     const dueDateRaw =
       stripXml(readTag(segment, "BILLDUE")) ||
       stripXml(readTag(segment, "BILLDUEDATE")) ||
@@ -1144,6 +1155,9 @@ function parseOfficialBillWiseOutstandingReport(input: {
     const overdueDaysRaw = stripXml(readTag(segment, "BILLOVERDUE"));
 
     const pendingAmount = toAbsNumber(billCloseRaw);
+    const openingAmount = toAbsNumber(billOpeningRaw);
+    const billAmount = openingAmount > 0 ? openingAmount : pendingAmount;
+
     const billDate = normalizeTallyDate(billDateRaw);
     const dueDate = normalizeTallyDate(dueDateRaw) || billDate;
 
@@ -1165,8 +1179,8 @@ function parseOfficialBillWiseOutstandingReport(input: {
       dueDate: formatIsoDate(dueDate),
 
       billType: input.billType,
-      openingAmount: pendingAmount,
-      billAmount: pendingAmount,
+      openingAmount: billAmount,
+      billAmount: billAmount,
       pendingAmount,
       outstandingAmount: pendingAmount,
 
