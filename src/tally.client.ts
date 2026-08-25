@@ -513,9 +513,9 @@ export async function fetchSalesOrdersXml(
             <FILTER>DateInSelectedRange</FILTER>
           </COLLECTION>
 
-         <SYSTEM TYPE="Formulae" NAME="OnlySalesVouchers">
-  $$IsSales:$VoucherTypeName AND NOT $$IsOrder:$VoucherTypeName
-</SYSTEM>
+          <SYSTEM TYPE="Formulae" NAME="OnlySalesVouchers">
+            ($$IsSales:$VoucherTypeName OR $$IsCreditNote:$VoucherTypeName) AND NOT $$IsOrder:$VoucherTypeName
+          </SYSTEM>
           ${buildDateRangeFilterFormula(dateRange)}
         </TDLMESSAGE>
       </TDL>
@@ -788,7 +788,7 @@ export async function fetchHistoricalSalesVouchersXml(
           </COLLECTION>
 
           <SYSTEM TYPE="Formulae" NAME="OnlyDeepSalesVouchers">
-            $$IsSales:$VoucherTypeName AND NOT $$IsOrder:$VoucherTypeName
+            ($$IsSales:$VoucherTypeName OR $$IsCreditNote:$VoucherTypeName) AND NOT $$IsOrder:$VoucherTypeName
           </SYSTEM>
           ${buildDateRangeFilterFormula(dateRange)}
         </TDLMESSAGE>

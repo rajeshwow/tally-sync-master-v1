@@ -1073,6 +1073,18 @@ function getVoucherNature(voucherType?: string | null) {
     };
   }
 
+  if (
+    type === "credit note" ||
+    type === "credit_note" ||
+    type === "sales return" ||
+    type === "sales_return"
+  ) {
+    return {
+      billType: "receivable",
+      effect: "adjustment",
+    };
+  }
+
   if (type === "receipt") {
     return {
       billType: "receivable",
