@@ -1117,15 +1117,84 @@ function isSameName(a?: string | null, b?: string | null) {
 }
 
 function buildOutstandingKey(input: {
+  companyGuid?: string;
+  companyName?: string;
+  financialYear?: string;
   billType: string;
   ledgerName: string;
   billRef: string;
 }) {
   return [
+    normalizeText(input.companyGuid || input.companyName || ""),
+    normalizeText(input.financialYear || ""),
     normalizeText(input.billType),
     normalizeText(input.ledgerName),
     normalizeText(input.billRef),
-  ].join("::");
+  ]
+    .filter(Boolean)
+    .join("::");
+}
+
+function resolveCanonicalClass(input: {
+  voucherType?: string | null;
+  billType?: string | null;
+  drCr?: string | null;
+}): { canonicalClass: string; drCr: "Dr" | "Cr" } {
+  const vType = String(input.voucherType || "").toLowerCase();
+  const bType = String(input.billType || "").toLowerCase();
+  const rawDrCr = String(input.drCr || "").toUpperCase().includes("CR") ? "Cr" : "Dr";
+
+  if (vType.includes("sales") || bType === "receivable" || bType === "sales") {
+    if (rawDrCr === "Cr") {
+      return { canonicalClass: "RECEIVABLE_CREDIT_ADJUSTMENT", drCr: "Cr" };
+    }
+    return { canonicalClass: "RECEIVABLE_BASE", drCr: "Dr" };
+  }
+
+  if (vType.includes("purchase") || bType === "payable" || bType === "purchase") {
+    if (rawDrCr === "Dr") {
+      return { canonicalClass: "PAYABLE_DEBIT_ADJUSTMENT", drCr: "Dr" };
+    }
+    return { canonicalClass: "PAYABLE_BASE", drCr: "Cr" };
+  }
+
+  if (vType.includes("receipt") || bType === "receipt") {
+    return { canonicalClass: "RECEIVABLE_SETTLEMENT", drCr: "Cr" };
+  }
+
+  if (vType.includes("payment") || bType === "payment") {
+    return { canonicalClass: "PAYABLE_SETTLEMENT", drCr: "Dr" };
+  }
+
+  if (vType.includes("credit note") || bType === "credit_note") {
+    return { canonicalClass: "RECEIVABLE_CREDIT_ADJUSTMENT", drCr: "Cr" };
+  }
+
+  if (vType.includes("debit note") || bType === "debit_note") {
+    return { canonicalClass: "PAYABLE_DEBIT_ADJUSTMENT", drCr: "Dr" };
+  }
+
+  if (bType === "advance") {
+    return rawDrCr === "Dr"
+      ? { canonicalClass: "PAYABLE_ADVANCE_DEBIT", drCr: "Dr" }
+      : { canonicalClass: "RECEIVABLE_ADVANCE_CREDIT", drCr: "Cr" };
+  }
+
+  if (bType === "on_account") {
+    return rawDrCr === "Dr"
+      ? { canonicalClass: "PAYABLE_ON_ACCOUNT", drCr: "Dr" }
+      : { canonicalClass: "RECEIVABLE_ON_ACCOUNT", drCr: "Cr" };
+  }
+
+  if (vType.includes("journal")) {
+    return rawDrCr === "Dr"
+      ? { canonicalClass: "JOURNAL_DEBIT", drCr: "Dr" }
+      : { canonicalClass: "JOURNAL_CREDIT", drCr: "Cr" };
+  }
+
+  return rawDrCr === "Cr"
+    ? { canonicalClass: "RECEIVABLE_CREDIT_ADJUSTMENT", drCr: "Cr" }
+    : { canonicalClass: "RECEIVABLE_BASE", drCr: "Dr" };
 }
 
 function normalizeLedgerName(value?: string | null) {
