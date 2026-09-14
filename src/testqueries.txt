@@ -1,0 +1,19 @@
+C:\Windows\System32\curl.exe -X POST "http://127.0.0.1:5050/sync/historical/sales-vouchers" ^
+-H "Authorization: Bearer YOUR_TOKEN" ^
+-H "Content-Type: application/json" ^
+-d "{\"fromDate\":\"20230401\",\"toDate\":\"20260909\",\"companyName\":\"Binary Infosolutions Pvt Ltd - (from 1-Apr-2023)\",\"forceRestart\":true}"
+
+
+C:\Windows\System32\curl.exe -X POST "http://127.0.0.1:5050/sync/historical/purchase-vouchers" ^
+-H "Authorization: Bearer YOUR_TOKEN" ^
+-H "Content-Type: application/json" ^
+-d "{\"fromDate\":\"20230401\",\"toDate\":\"20260909\",\"companyName\":\"Binary Infosolutions Pvt Ltd - (from 1-Apr-2023)\",\"forceRestart\":true}"
+
+
+---------------------
+SELECT cost_center_source, COUNT(*), SUM(pending_amount)
+FROM tally_outstandings
+WHERE tenant_id = '97ae568d-a1b3-4f8a-a82c-89d054ab60bf'
+  AND tally_company_name = 'Binary Infosolutions Pvt Ltd - (from 1-Apr-2023)'
+  AND deleted_at IS NULL AND status = 'open'
+GROUP BY 1;
