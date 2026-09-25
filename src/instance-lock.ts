@@ -52,7 +52,18 @@ export function acquireSingleInstanceLock(role: string) {
 
   const existing = readExistingLock(lockFile);
 
-  if (existing && isProcessAlive(Number(existing.pid))) {
+  // A lock written before the current boot is stale even if its PID has
+  // since been reused by an unrelated process.
+  const bootTimeMs = Date.now() - os.uptime() * 1000;
+  const lockStartedMs = Date.parse(existing?.startedAt || "");
+  const lockFromPreviousBoot =
+    Number.isFinite(lockStartedMs) && lockStartedMs < bootTimeMs;
+
+  if (
+    existing &&
+    !lockFromPreviousBoot &&
+    isProcessAlive(Number(existing.pid))
+  ) {
     throw new Error(
       `Another Tally sync agent is already running. pid=${existing.pid}, role=${existing.role}, host=${existing.hostname}, startedAt=${existing.startedAt}, lock=${lockFile}`,
     );
