@@ -1,4 +1,7 @@
 import axios, { AxiosError } from "axios";
+import fs from "fs";
+import os from "os";
+import path from "path";
 
 const CRM_BASE_URL = process.env.CRM_BASE_URL;
 const CRM_TENANT_SLUG = process.env.CRM_TENANT_SLUG;
@@ -19,12 +22,63 @@ if (!TALLY_AGENT_TOKEN) {
   throw new Error("[CRM CLIENT] TALLY_AGENT_TOKEN is missing in .env");
 }
 
+/**
+ * Identifies this agent to the CRM so admins can see which machine /
+ * Windows login is syncing (Tally Sync > Sync Sources).
+ * CLIENTNAME is set by Windows inside an RDP session = the user's own PC.
+ */
+function safeHeader(value: unknown): string {
+  return String(value ?? "")
+    .replace(/[^ -~]/g, "")
+    .trim()
+    .slice(0, 120);
+}
+
+function readAgentVersion(): string {
+  for (const rel of ["../package.json", "../../package.json"]) {
+    try {
+      const pkg = JSON.parse(
+        fs.readFileSync(path.resolve(__dirname, rel), "utf8"),
+      );
+      if (pkg?.version) return String(pkg.version);
+    } catch {
+      // try next location
+    }
+  }
+  return process.env.npm_package_version || "";
+}
+
+function agentIdentityHeaders(): Record<string, string> {
+  let osUser = process.env.USERNAME || "";
+  try {
+    osUser = os.userInfo().username || osUser;
+  } catch {
+    // userInfo can throw for some service accounts
+  }
+
+  const headers: Record<string, string> = {
+    "X-Tally-Machine": safeHeader(process.env.TALLY_AGENT_MACHINE_NAME || os.hostname()),
+    "X-Tally-Os-User": safeHeader(osUser),
+    "X-Tally-Agent-Version": safeHeader(readAgentVersion()),
+  };
+
+  const clientName = safeHeader(process.env.CLIENTNAME);
+  if (clientName && clientName.toLowerCase() !== "console") {
+    headers["X-Tally-Client-Name"] = clientName;
+  }
+
+  return Object.fromEntries(
+    Object.entries(headers).filter(([, v]) => Boolean(v)),
+  );
+}
+
 const client = axios.create({
   baseURL: `${CRM_BASE_URL.replace(/\/$/, "")}/${CRM_TENANT_SLUG}`,
   timeout: CRM_REQUEST_TIMEOUT_MS,
   headers: {
     Authorization: `Bearer ${TALLY_AGENT_TOKEN}`,
     "Content-Type": "application/json",
+    ...agentIdentityHeaders(),
   },
   maxBodyLength: Infinity,
   maxContentLength: Infinity,
