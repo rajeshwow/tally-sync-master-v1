@@ -715,3 +715,60 @@ export async function markHistoricalSyncProgressInCrm(input: {
 
   return response.data;
 }
+
+/* ----------------------- sync machine coordination ----------------------- */
+
+export type AgentLiveStatus = {
+  tallyOpen: boolean;
+  tallyOpenSince: string | null;
+  isSyncing: boolean;
+  companies?: string[] | null;
+};
+
+export type SyncTurnDecision = {
+  allowed: boolean;
+  reason: string;
+  mode?: string;
+  selected_source?: string | null;
+  lease_ttl_seconds?: number;
+};
+
+const COORDINATION_TIMEOUT_MS = 15000;
+
+function liveStatusBody(status: AgentLiveStatus) {
+  return {
+    tally_open: status.tallyOpen,
+    tally_open_since: status.tallyOpenSince,
+    is_syncing: status.isSyncing,
+    companies: status.companies ?? undefined,
+  };
+}
+
+export async function sendSourceHeartbeatToCrm(status: AgentLiveStatus) {
+  const response = await client.post(
+    "/tally/agent/source-heartbeat",
+    liveStatusBody(status),
+    { timeout: COORDINATION_TIMEOUT_MS },
+  );
+  return response.data;
+}
+
+export async function claimSyncTurnFromCrm(
+  status: AgentLiveStatus,
+): Promise<SyncTurnDecision> {
+  const response = await client.post(
+    "/tally/agent/sync-turn/claim",
+    liveStatusBody(status),
+    { timeout: COORDINATION_TIMEOUT_MS },
+  );
+  return response.data?.data as SyncTurnDecision;
+}
+
+export async function releaseSyncTurnInCrm() {
+  const response = await client.post(
+    "/tally/agent/sync-turn/release",
+    {},
+    { timeout: COORDINATION_TIMEOUT_MS },
+  );
+  return response.data;
+}

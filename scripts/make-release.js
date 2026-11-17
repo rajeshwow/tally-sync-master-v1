@@ -11,8 +11,16 @@
  * Machine files (.env, logs, tmp, checkpoints, node_modules) are never packed,
  * so the client's settings and sync progress are untouched by an update.
  *
- * Bump "version" in package.json before every release: the server rejects a
- * version that was already uploaded.
+ * The version is bumped automatically on every release (the server rejects a
+ * version that was already uploaded), in package.json and package-lock.json:
+ *
+ *   npm run release            1.1.1 -> 1.1.2  (patch, default: fixes)
+ *   npm run release -- minor   1.1.1 -> 1.2.0  (new features)
+ *   npm run release -- major   1.1.1 -> 2.0.0  (breaking changes)
+ *   npm run release -- 1.5.0   exact version
+ *   npm run release -- keep    no bump (re-pack the current version)
+ *
+ * If the build fails, the version is put back as it was.
  */
 const { execSync } = require("child_process");
 const crypto = require("crypto");
@@ -35,10 +43,64 @@ function walk(absPath, relPath, out) {
   out.push({ path: relPath, data: fs.readFileSync(absPath).toString("base64") });
 }
 
+const PKG_FILE = path.join(ROOT, "package.json");
+const LOCK_FILE = path.join(ROOT, "package-lock.json");
+
+function nextVersion(current, bump) {
+  if (/^\d+\.\d+\.\d+$/.test(bump)) return bump;
+  const m = /^(\d+)\.(\d+)\.(\d+)/.exec(current);
+  if (!m) throw new Error(`Cannot bump non-semver version "${current}"`);
+  let [major, minor, patch] = m.slice(1).map(Number);
+  if (bump === "major") return `${major + 1}.0.0`;
+  if (bump === "minor") return `${major}.${minor + 1}.0`;
+  if (bump === "patch") return `${major}.${minor}.${patch + 1}`;
+  throw new Error(`Unknown bump "${bump}". Use patch, minor, major, keep or x.y.z`);
+}
+
+/** Writes the new version to package.json and package-lock.json. */
+function writeVersion(version) {
+  const pkg = JSON.parse(fs.readFileSync(PKG_FILE, "utf8"));
+  pkg.version = version;
+  fs.writeFileSync(PKG_FILE, JSON.stringify(pkg, null, 2) + "\n");
+
+  if (fs.existsSync(LOCK_FILE)) {
+    const lock = JSON.parse(fs.readFileSync(LOCK_FILE, "utf8"));
+    lock.version = version;
+    if (lock.packages && lock.packages[""]) lock.packages[""].version = version;
+    fs.writeFileSync(LOCK_FILE, JSON.stringify(lock, null, 2) + "\n");
+  }
+}
+
 function main() {
-  const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
-  const version = String(pkg.version || "").trim();
-  if (!version) throw new Error("package.json has no version");
+  const bump = String(process.argv[2] || "patch").trim().toLowerCase();
+  const originalPkg = fs.readFileSync(PKG_FILE, "utf8");
+  const originalLock = fs.existsSync(LOCK_FILE)
+    ? fs.readFileSync(LOCK_FILE, "utf8")
+    : null;
+
+  const current = String(JSON.parse(originalPkg).version || "").trim();
+  if (!current) throw new Error("package.json has no version");
+
+  const version = bump === "keep" ? current : nextVersion(current, bump);
+  if (version !== current) {
+    writeVersion(version);
+    console.log(`Version bumped: ${current} -> ${version}`);
+  }
+
+  try {
+    buildBundle(version);
+  } catch (error) {
+    if (version !== current) {
+      fs.writeFileSync(PKG_FILE, originalPkg);
+      if (originalLock !== null) fs.writeFileSync(LOCK_FILE, originalLock);
+      console.error(`Version restored to ${current}`);
+    }
+    throw error;
+  }
+}
+
+function buildBundle(version) {
+  const pkg = JSON.parse(fs.readFileSync(PKG_FILE, "utf8"));
 
   console.log(`Building tally-sync-agent ${version} ...`);
   // Clean build so files deleted from src/ do not linger in dist/.
