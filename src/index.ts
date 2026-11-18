@@ -1,7 +1,9 @@
+import axios from "axios";
 import cors from "cors";
 import "dotenv/config";
 import express, { NextFunction, Request, Response } from "express";
-import cron from "node-cron";
+import fs from "fs";
+import path from "path";
 import { getTallyCompanyDiagnostics } from "./company-registry";
 import { getDailySyncStatus, runDailySync } from "./daily-sync.service";
 import {
@@ -33,15 +35,26 @@ function readBoolEnv(name: string, fallback: boolean) {
   return ["1", "true", "yes", "y"].includes(raw.trim().toLowerCase());
 }
 
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 const SYNC_INTERVAL_MINUTES = Math.max(
   1,
   Number(process.env.SYNC_INTERVAL_MINUTES || 30),
 );
-const SYNC_CRON = process.env.SYNC_CRON || `*/${SYNC_INTERVAL_MINUTES} * * * *`;
+// Checks whether any Tally is serving TALLY_URL. The daily sync starts as soon
+// as one answers, instead of waiting for a fixed clock time.
+const TALLY_URL = process.env.TALLY_URL || "";
+const TALLY_WATCH_SECONDS = Math.max(
+  15,
+  Number(process.env.TALLY_WATCH_SECONDS || 60),
+);
+const DAILY_SYNC_RETRY_MINUTES = Math.max(
+  1,
+  Number(process.env.DAILY_SYNC_RETRY_MINUTES || 10),
+);
+const LAST_DAILY_SYNC_FILE = path.resolve(
+  process.cwd(),
+  "logs",
+  "last-daily-sync.json",
+);
 const AUTO_SYNC_DISABLED = readBoolEnv("DISABLE_AUTO_SYNC", false);
 const DAILY_SYNC_ENABLED = readBoolEnv("DAILY_SYNC_ENABLED", true);
 const DAILY_SYNC_RUN_ON_START = readBoolEnv("DAILY_SYNC_RUN_ON_START", false);
@@ -56,6 +69,39 @@ let lastManualSyncCompletedAt: string | null = null;
 let lastManualSyncStatus: "idle" | "running" | "success" | "failed" = "idle";
 let lastManualSyncError: string | null = null;
 let lastManualSyncResult: any = null;
+
+let isTallyReachable: boolean | null = null;
+let isTallyWatchBusy = false;
+let lastDailySyncFailedAtMs = 0;
+let lastDailySyncSuccessAt: string | null = readLastDailySyncSuccessAt();
+
+function readLastDailySyncSuccessAt(): string | null {
+  try {
+    const saved = JSON.parse(fs.readFileSync(LAST_DAILY_SYNC_FILE, "utf8"));
+    return typeof saved?.lastSuccessAt === "string"
+      ? saved.lastSuccessAt
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveLastDailySyncSuccessAt(at: string) {
+  lastDailySyncSuccessAt = at;
+
+  try {
+    fs.mkdirSync(path.dirname(LAST_DAILY_SYNC_FILE), { recursive: true });
+    fs.writeFileSync(
+      LAST_DAILY_SYNC_FILE,
+      JSON.stringify({ lastSuccessAt: at }, null, 2),
+    );
+  } catch (error: any) {
+    console.warn("[DAILY SYNC] Could not save last success time", {
+      file: LAST_DAILY_SYNC_FILE,
+      error: error?.message || error,
+    });
+  }
+}
 
 function requireControlToken(req: Request, res: Response, next: NextFunction) {
   const expectedToken = process.env.TALLY_AGENT_TOKEN || "";
@@ -99,7 +145,10 @@ function getAgentStatus() {
       disable_auto_sync: AUTO_SYNC_DISABLED,
       daily_sync_enabled: DAILY_SYNC_ENABLED,
       run_on_start: DAILY_SYNC_RUN_ON_START,
-      cron: SYNC_CRON,
+      trigger: "when_tally_reachable",
+      tally_watch_seconds: TALLY_WATCH_SECONDS,
+      tally_reachable: isTallyReachable,
+      last_success_at: lastDailySyncSuccessAt,
       interval_minutes: SYNC_INTERVAL_MINUTES,
       company_selection: "all_loaded_companies",
       runtime: getDailySyncStatus(),
@@ -641,7 +690,7 @@ app.post("/sync/transactions/historical", requireControlToken, (req, res) => {
 });
 
 async function executeAutomaticDailySync(
-  source: "startup" | "cron" | "manual",
+  source: "watcher" | "manual",
 ) {
   try {
     if (isManualSyncRunning) {
@@ -680,70 +729,111 @@ async function executeAutomaticDailySync(
       range: result?.range || null,
     });
 
-    return result;
-  } catch (error: any) {
-    console.error(`[DAILY SYNC:${source}] Failed`, error?.message || error);
-
-    return {
-      skipped: false,
-      status: "failed",
-      error: error?.message || "Daily sync failed",
-    };
-  }
-}
-
-async function runStartupDailySyncWhenReady() {
-  const pollSeconds = Math.max(
-    10,
-    Number(process.env.DAILY_SYNC_STARTUP_POLL_SECONDS || 30),
-  );
-  const maxWaitMinutes = Math.max(
-    0,
-    Number(process.env.DAILY_SYNC_STARTUP_MAX_WAIT_MINUTES || 0),
-  );
-  const startedAtMs = Date.now();
-
-  console.log("[DAILY SYNC:startup] Waiting for Tally loaded companies", {
-    pollSeconds,
-    maxWaitMinutes: maxWaitMinutes || "unlimited",
-  });
-
-  while (true) {
-    if (
-      maxWaitMinutes > 0 &&
-      Date.now() - startedAtMs > maxWaitMinutes * 60 * 1000
-    ) {
-      console.warn(
-        "[DAILY SYNC:startup] Startup wait stopped because max wait was reached",
-      );
-      return;
-    }
-
-    const result = await executeAutomaticDailySync("startup");
-
     if (
       !result?.skipped &&
       (result?.status === "success" || result?.status === "partial_success")
     ) {
-      return;
+      saveLastDailySyncSuccessAt(new Date().toISOString());
     }
 
-    await sleep(pollSeconds * 1000);
+    return result;
+  } catch (error: any) {
+    // Network errors from axios carry an empty message and a huge object;
+    // log just the code so the log stays readable.
+    const reason = error?.isAxiosError
+      ? `${error.code || "HTTP_ERROR"} calling ${error.config?.url || "unknown url"}${error.message ? ` - ${error.message}` : ""}`
+      : error?.message || String(error);
+
+    console.error(`[DAILY SYNC:${source}] Failed: ${reason}`);
+
+    return {
+      skipped: false,
+      status: "failed",
+      error: reason,
+    };
+  }
+}
+
+/**
+ * Lightweight "is any Tally open on TALLY_URL?" check. Tally answers a plain
+ * GET with "TallyPrime Server is Running", so this puts no load on Tally.
+ */
+async function checkTallyReachable() {
+  try {
+    await axios.get(TALLY_URL, { timeout: 5000 });
+    return true;
+  } catch (error: any) {
+    // Any HTTP response means Tally is listening.
+    return Boolean(error?.response);
+  }
+}
+
+function isDailySyncDue() {
+  // Don't hammer a user's Tally with a full sync every minute when something
+  // other than Tally (e.g. CRM) keeps failing.
+  if (
+    lastDailySyncFailedAtMs &&
+    Date.now() - lastDailySyncFailedAtMs < DAILY_SYNC_RETRY_MINUTES * 60 * 1000
+  ) {
+    return false;
+  }
+
+  if (!lastDailySyncSuccessAt) return true;
+
+  const lastMs = Date.parse(lastDailySyncSuccessAt);
+  if (!Number.isFinite(lastMs)) return true;
+
+  return Date.now() - lastMs >= SYNC_INTERVAL_MINUTES * 60 * 1000;
+}
+
+/**
+ * Runs every TALLY_WATCH_SECONDS. Whoever opens Tally first, the daily sync
+ * starts within a minute, then repeats every SYNC_INTERVAL_MINUTES while a
+ * Tally stays open. Failed runs are retried on the next tick.
+ */
+async function tallyWatchTick() {
+  if (isTallyWatchBusy) return;
+  isTallyWatchBusy = true;
+
+  try {
+    const reachable = await checkTallyReachable();
+
+    if (reachable !== isTallyReachable) {
+      console.log(
+        reachable
+          ? `[TALLY WATCH] Tally is reachable at ${TALLY_URL}`
+          : `[TALLY WATCH] Tally is not reachable at ${TALLY_URL}. Daily sync will start when someone opens Tally.`,
+        { at: new Date().toISOString(), lastSuccessAt: lastDailySyncSuccessAt },
+      );
+      isTallyReachable = reachable;
+    }
+
+    if (!reachable || !isDailySyncDue()) return;
+
+    const result = await executeAutomaticDailySync("watcher");
+
+    if (result?.status === "failed") {
+      // Tally closed mid-sync: retry as soon as it is back. Anything else:
+      // wait DAILY_SYNC_RETRY_MINUTES before trying again.
+      lastDailySyncFailedAtMs = (await checkTallyReachable()) ? Date.now() : 0;
+    } else {
+      lastDailySyncFailedAtMs = 0;
+    }
+  } catch (error: any) {
+    console.error("[TALLY WATCH] Tick failed", error?.message || error);
+  } finally {
+    isTallyWatchBusy = false;
   }
 }
 
 if (AUTO_SYNC_ENABLED) {
-  if (!cron.validate(SYNC_CRON)) {
-    throw new Error(`Invalid SYNC_CRON expression: ${SYNC_CRON}`);
-  }
+  setInterval(() => void tallyWatchTick(), TALLY_WATCH_SECONDS * 1000);
 
-  cron.schedule(SYNC_CRON, async () => {
-    await executeAutomaticDailySync("cron");
-  });
-
-  console.log("[DAILY SYNC] Cron scheduled", {
-    syncCron: SYNC_CRON,
+  console.log("[DAILY SYNC] Tally watcher scheduled", {
+    tallyUrl: TALLY_URL,
+    watchSeconds: TALLY_WATCH_SECONDS,
     syncIntervalMinutes: SYNC_INTERVAL_MINUTES,
+    lastSuccessAt: lastDailySyncSuccessAt,
     companySelection: "all_loaded_companies",
   });
 } else {
@@ -781,7 +871,7 @@ process.on("exit", () => releaseSingleInstanceLock());
 app.listen(PORT, () => {
   console.log(`Tally Sync Agent running on port ${PORT}`);
 
-  if (AUTO_SYNC_ENABLED && DAILY_SYNC_RUN_ON_START) {
-    void runStartupDailySyncWhenReady();
+  if (AUTO_SYNC_ENABLED) {
+    void tallyWatchTick();
   }
 });
