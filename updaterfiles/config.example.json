@@ -1,0 +1,6 @@
+{
+  "agentDir": "C:\\TallySync\\agent",
+  "healthySeconds": 90,
+  "maxSyncWaitMinutes": 180,
+  "npmInstallTimeoutMinutes": 15
+}
