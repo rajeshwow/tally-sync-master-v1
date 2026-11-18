@@ -8,7 +8,8 @@
     "dev:daily": "ts-node-dev --respawn src/index.ts",
     "build": "tsc",
     "start": "npm run build && node dist/index.js",
-    "start:daily": "npm run build && node dist/index.js"
+    "start:daily": "npm run build && node dist/index.js",
+    "release": "node scripts/make-release.js"
   },
   "keywords": [],
   "author": "",

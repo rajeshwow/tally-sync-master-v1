@@ -5,7 +5,11 @@ import express, { NextFunction, Request, Response } from "express";
 import fs from "fs";
 import path from "path";
 import { getTallyCompanyDiagnostics } from "./company-registry";
-import { getDailySyncStatus, runDailySync } from "./daily-sync.service";
+import {
+  getDailySyncStatus,
+  isDailySyncActive,
+  runDailySync,
+} from "./daily-sync.service";
 import {
   getHistoricalSyncStatus,
   startHistoricalSyncInBackground,
@@ -19,6 +23,12 @@ import {
   releaseSingleInstanceLock,
 } from "./instance-lock";
 import { runFullSync, runStockItemsOnlySync } from "./sync.service";
+import {
+  claimSyncTurn,
+  getSyncCoordinationStatus,
+  releaseSyncTurn,
+  startSyncCoordinator,
+} from "./sync-coordinator";
 
 const app = express();
 
@@ -153,6 +163,7 @@ function getAgentStatus() {
       company_selection: "all_loaded_companies",
       runtime: getDailySyncStatus(),
     },
+    sync_coordination: getSyncCoordinationStatus(),
     time: new Date().toISOString(),
   };
 }
@@ -714,12 +725,40 @@ async function executeAutomaticDailySync(
       return { skipped: true, status: "skipped" };
     }
 
+    // Scheduled runs only sync when the CRM picks this machine
+    // (admin-selected machine, or first machine with Tally open).
+    // Manual runs are explicit and are not gated.
+    let holdsSyncTurn = false;
+    if (source !== "manual") {
+      if (isDailySyncActive()) {
+        return { skipped: true, status: "skipped" };
+      }
+
+      const turn = await claimSyncTurn();
+      if (!turn.allowed) {
+        console.log(`[DAILY SYNC:${source}] Skipped: another machine syncs`, {
+          reason: turn.reason,
+          selectedMachine: turn.selected_source || null,
+        });
+        return { skipped: true, status: "skipped", reason: turn.reason };
+      }
+      holdsSyncTurn = true;
+      console.log(`[DAILY SYNC:${source}] Sync turn granted`, {
+        reason: turn.reason,
+      });
+    }
+
     console.log(`[DAILY SYNC:${source}] Started`, {
       at: new Date().toISOString(),
       companySelection: "all_loaded_companies",
     });
 
-    const result = await runDailySync();
+    let result: any;
+    try {
+      result = await runDailySync();
+    } finally {
+      if (holdsSyncTurn) await releaseSyncTurn();
+    }
 
     console.log(`[DAILY SYNC:${source}] Completed`, {
       status: result?.status || null,
@@ -819,10 +858,18 @@ async function tallyWatchTick() {
     } else {
       lastDailySyncFailedAtMs = 0;
     }
-  } catch (error: any) {
-    console.error("[TALLY WATCH] Tick failed", error?.message || error);
-  } finally {
-    isTallyWatchBusy = false;
+
+    // Another machine has the sync turn; the cron will ask again later.
+    const reason = (result as any)?.reason;
+    if (
+      reason === "another_machine_syncing" ||
+      reason === "preferred_machine_online" ||
+      reason === "earlier_tally_open"
+    ) {
+      return;
+    }
+
+    await sleep(pollSeconds * 1000);
   }
 }
 
@@ -871,7 +918,15 @@ process.on("exit", () => releaseSingleInstanceLock());
 app.listen(PORT, () => {
   console.log(`Tally Sync Agent running on port ${PORT}`);
 
-  if (AUTO_SYNC_ENABLED) {
-    void tallyWatchTick();
+  startSyncCoordinator(
+    () =>
+      isDailySyncActive() ||
+      isManualSyncRunning ||
+      isHistoricalSyncActive() ||
+      isHistoricalTransactionsSyncActive(),
+  );
+
+  if (AUTO_SYNC_ENABLED && DAILY_SYNC_RUN_ON_START) {
+    void runStartupDailySyncWhenReady();
   }
 });
