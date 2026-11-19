@@ -858,18 +858,10 @@ async function tallyWatchTick() {
     } else {
       lastDailySyncFailedAtMs = 0;
     }
-
-    // Another machine has the sync turn; the cron will ask again later.
-    const reason = (result as any)?.reason;
-    if (
-      reason === "another_machine_syncing" ||
-      reason === "preferred_machine_online" ||
-      reason === "earlier_tally_open"
-    ) {
-      return;
-    }
-
-    await sleep(pollSeconds * 1000);
+  } catch (error: any) {
+    console.error("[TALLY WATCH] Tick failed", error?.message || error);
+  } finally {
+    isTallyWatchBusy = false;
   }
 }
 
@@ -926,7 +918,7 @@ app.listen(PORT, () => {
       isHistoricalTransactionsSyncActive(),
   );
 
-  if (AUTO_SYNC_ENABLED && DAILY_SYNC_RUN_ON_START) {
-    void runStartupDailySyncWhenReady();
+  if (AUTO_SYNC_ENABLED) {
+    void tallyWatchTick();
   }
 });
