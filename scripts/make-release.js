@@ -113,6 +113,16 @@ function buildBundle(version) {
     if (fs.existsSync(abs)) walk(abs, entry, files);
   }
 
+  // Ship the updater with every release: the updater on the machine replaces
+  // itself with updater/updater.js when it differs (no AnyDesk needed).
+  const updaterSrc = process.env.UPDATER_JS || path.resolve(ROOT, "..", "..", "tally-agent-updater", "updater.js");
+  if (fs.existsSync(updaterSrc)) {
+    files.push({ path: "updater/updater.js", data: fs.readFileSync(updaterSrc).toString("base64") });
+    console.log(`Including updater: ${updaterSrc}`);
+  } else {
+    console.warn(`Updater not found at ${updaterSrc} (set UPDATER_JS); release will not update the updater.`);
+  }
+
   for (const required of REQUIRED) {
     if (!files.some((f) => f.path === required)) {
       throw new Error(`Build output is missing ${required}`);
