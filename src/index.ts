@@ -22,6 +22,7 @@ import {
   acquireSingleInstanceLock,
   releaseSingleInstanceLock,
 } from "./instance-lock";
+import { runChallanImportOnce } from "./one-time-challan-import";
 import { runFullSync, runStockItemsOnlySync } from "./sync.service";
 import {
   claimSyncTurn,
@@ -756,6 +757,14 @@ async function executeAutomaticDailySync(
     let result: any;
     try {
       result = await runDailySync();
+
+      // TEMPORARY: one-time challan-company DC import (no-op once done).
+      if (
+        !result?.skipped &&
+        (result?.status === "success" || result?.status === "partial_success")
+      ) {
+        await runChallanImportOnce();
+      }
     } finally {
       if (holdsSyncTurn) await releaseSyncTurn();
     }
